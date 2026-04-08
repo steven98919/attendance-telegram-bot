@@ -10,13 +10,14 @@ load_dotenv()
 SPECIAL_NAMES = [n.strip() for n in os.getenv("SPECIAL_NAMES", "").split(",")]
 
 
-def process_template_export(employee, year, pdf_filename):
+def process_template_export(employee, year, pdf_filename, end_date=None):
     year = int(year)
     StartYear, EndYear = date_range(year)
 
-    # for custom enddate
-    # EndYear = '2025-10-12'
-    
+    # for custom enddate - override if end_date is provided
+    if end_date:
+        EndYear = end_date
+
     att = MergeAttendanceAndLeaveInfo(StartYear, EndYear)
 
     for special_name in SPECIAL_NAMES:

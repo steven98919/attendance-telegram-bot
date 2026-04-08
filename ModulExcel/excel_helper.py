@@ -101,7 +101,7 @@ def generate_formulas_cuti(row_number, index, year=dt.now().year):
         return f'{data[0][1]}'
 
     def case4():
-        return f'=VLOOKUP(A{row_number},KEHADIRAN!$A$4:$I$100,9,FALSE)+INT(VLOOKUP(A{row_number},KEHADIRAN!$A$4:$K$100,11,FALSE)/2)'
+        return f'=VLOOKUP(A{row_number},KEHADIRAN!$A$4:$I$100,9,FALSE)'
 
     def case5():
         return f'=F{row_number}+G{row_number}'

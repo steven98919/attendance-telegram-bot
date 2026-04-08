@@ -15,23 +15,81 @@ import threading
 from telegram_bot_calendar import DetailedTelegramCalendar, LSTEP
 from telegram.ext import CallbackQueryHandler
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import logging
+from logging.handlers import TimedRotatingFileHandler
 
 # env variable
 load_dotenv()
 BOT_API = os.getenv('BOT_API')
 bot = telebot.TeleBot(BOT_API)
 
+# Configure logging with weekly rotation
+# Use absolute path to ensure logs go to the correct location regardless of where cron runs it from
+log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)
+
+# File handler with daily rotation (delete old logs)
+file_handler = TimedRotatingFileHandler(
+    filename=os.path.join(log_dir, "bot.log"),
+    when="midnight",
+    interval=1,  # Rotate daily
+    backupCount=7,  # Keep only last 7 days of logs
+    encoding="utf-8"
+)
+
+# Custom namer for rotated files: bot-log-dd-mm-yyyy.log
+def custom_namer(default_name):
+    # Extract the date from the default name (bot.log.YYYY-MM-DD)
+    import re
+    from datetime import datetime
+    match = re.search(r'\.(\d{4}-\d{2}-\d{2})$', default_name)
+    if match:
+        date_str = match.group(1)
+        # Convert YYYY-MM-DD to dd-mm-yyyy
+        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+        formatted_date = date_obj.strftime('%d-%m-%Y')
+        # Replace bot.log.YYYY-MM-DD with bot-log-dd-mm-yyyy.log
+        base_dir = os.path.dirname(default_name)
+        return os.path.join(base_dir, f"bot-log-{formatted_date}.log")
+    return default_name
+
+file_handler.namer = custom_namer
+
+file_handler.setFormatter(logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+))
+
+# Console handler
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter(
+    '%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+))
+
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
+logger.info("=" * 50)
+logger.info("Bot started at " + str(datetime.now()))
+logger.info("=" * 50)
+
 # Variabel global untuk menyimpan data karyawan
 all_employees = []
 tele_id_admin = [int(id) for id in os.getenv("TELEBOT_ID_ADMIN", "").split(",") if id]
-print(tele_id_admin)
+logger.info(f"Admin IDs loaded: {tele_id_admin}")
 def check_telegram_id(client_telegram_id):
     global tele_id_admin
     if client_telegram_id not in tele_id_admin:
-        print(f"Unauthorized access. Do nothing or return an error message. id = {client_telegram_id}")
+        logger.warning(f"Unauthorized access attempt. ID = {client_telegram_id}")
         return True
     else:
-        print("Authorized access. Proceed with the request.")
+        logger.info(f"Authorized access. ID = {client_telegram_id}")
         return False
     
 # Fungsi untuk mendapatkan data karyawan jika belum tersedia
@@ -99,18 +157,25 @@ def start(message):
     today_process(message.chat.id)
 
 def today_process(chat_id):
-    att = getAttendance_and_non_attendance(date.today())
-    print(att)
-    cuti = ShowingIzin(date.today(),date.today(), True)
+    logger.info(f"today_process started for chat_id: {chat_id}, date: {date.today()}")
+    try:
+        att = getAttendance_and_non_attendance(date.today())
+        logger.debug(f"Attendance data retrieved: {len(att) if att else 0} records")
+        cuti = ShowingIzin(date.today(),date.today(), True)
+        logger.debug(f"Izin data retrieved")
 
-    output = template_daily_report(date.today(), att, cuti)
+        output = template_daily_report(date.today(), att, cuti)
 
-    bot.send_message(chat_id, output['tepat'])
-    bot.send_message(chat_id, output['telat'])
+        bot.send_message(chat_id, output['tepat'])
+        bot.send_message(chat_id, output['telat'])
 
-    list_karyawan = output['list_karyawan']
-    if not len(list_karyawan) == 0 :
-        input_after_today_and_hisotry(list_karyawan, chat_id, date.today())
+        list_karyawan = output['list_karyawan']
+        if not len(list_karyawan) == 0 :
+            input_after_today_and_hisotry(list_karyawan, chat_id, date.today())
+        logger.info(f"today_process completed successfully for chat_id: {chat_id}")
+    except Exception as e:
+        logger.error(f"Error in today_process for chat_id: {chat_id} - {str(e)}", exc_info=True)
+        bot.send_message(chat_id, "❌ Error processing daily report.")
 
 def input_after_today_and_hisotry(list_karyawan, chat_id, date):
     global global_get_izin_by_date
@@ -152,26 +217,128 @@ def start(message):
     inline_keyboard.add(InlineKeyboardButton('Batal', callback_data='batal'))
     bot.send_message(message.chat.id, text="Choose a year:", reply_markup=inline_keyboard)
 
-def proses_export(year, chat_id, message_id=False):
+@bot.message_handler(commands=['test_scheduled_export'])
+def test_scheduled_export_command(message):
+    """Test command to simulate scheduled export with retry mechanism"""
+    # Only allow specific test ID or admins
+    if message.chat.id not in tele_id_admin:
+        bot.send_message(message.chat.id, "❌ Unauthorized. Only admins can test scheduled export.")
+        return
+
+    bot.send_message(message.chat.id, "🧪 Starting scheduled export test with retry mechanism...")
+    logger.info(f"[TEST] Manual test of scheduled export triggered by ID: {message.chat.id}")
+
+    year = datetime.now().year
+    max_retries = 3
+    retry_delay = 10  # Use 10 seconds for testing instead of 5 minutes
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            bot.send_message(message.chat.id, f"🔄 Attempt {attempt}/{max_retries}...")
+            logger.info(f"[TEST] Export attempt {attempt}/{max_retries}")
+
+            proses_export(year, message.chat.id)
+
+            bot.send_message(message.chat.id, f"✅ Export completed successfully on attempt {attempt}")
+            logger.info(f"[TEST] Export completed successfully on attempt {attempt}")
+            return  # Success, exit function
+
+        except Exception as e:
+            error_msg = f"❌ Attempt {attempt}/{max_retries} failed: {str(e)}"
+            bot.send_message(message.chat.id, error_msg)
+            logger.error(f"[TEST] Export attempt {attempt}/{max_retries} failed: {str(e)}", exc_info=True)
+
+            if attempt < max_retries:
+                bot.send_message(message.chat.id, f"⏳ Waiting {retry_delay} seconds before retry...")
+                logger.info(f"[TEST] Waiting {retry_delay} seconds before retry...")
+                time.sleep(retry_delay)
+            else:
+                # All retries failed
+                logger.error("[TEST] All retry attempts failed")
+                error_message = (
+                    "❌ EXPORT WEEKLY REPORT OTOMATIS GAGAL\n"
+                    "Harap lakukan export manual."
+                )
+                bot.send_message(message.chat.id, error_message)
+
+def show_week_selection(year, chat_id, message_id):
+    """Show last 3 weeks selection after year is chosen"""
+    current_date = datetime.now().date()
+    selected_year = int(year)
+
+    # Tentukan minggu berdasarkan tahun yang dipilih
+    if selected_year == current_date.year:
+        # Jika tahun sekarang, gunakan minggu saat ini
+        iso_year, current_week, iso_day = current_date.isocalendar()
+    elif selected_year < current_date.year:
+        # Jika tahun lalu, gunakan minggu terakhir dari tahun itu
+        last_day_of_year = datetime(selected_year, 12, 31).date()
+        iso_year, current_week, iso_day = last_day_of_year.isocalendar()
+        # Jika minggu terakhir masuk tahun berikutnya (ISO week), gunakan minggu sebelumnya
+        if iso_year > selected_year:
+            last_day_of_year = datetime(selected_year, 12, 24).date()
+            iso_year, current_week, iso_day = last_day_of_year.isocalendar()
+    else:
+        # Jika tahun depan, gunakan minggu 3 (untuk menampilkan minggu 3, 2, 1)
+        current_week = 3
+
+    # Generate last 3 weeks
+    weeks = []
+    for i in range(3):
+        week_num = current_week - i
+        if week_num > 0:
+            weeks.append(week_num)
+
+    inline_keyboard = InlineKeyboardMarkup(row_width=1)
+    for week in weeks:
+        inline_keyboard.add(
+            InlineKeyboardButton(f'Week {week}', callback_data=f'exportweek_{year}.{week}')
+        )
+    inline_keyboard.add(InlineKeyboardButton('Batal', callback_data='batal'))
+
+    bot.edit_message_text(
+        f"Pilih minggu untuk export tahun {year}:",
+        chat_id,
+        message_id,
+        reply_markup=inline_keyboard
+    )
+
+def get_week_end_date(year, week):
+    """Get the last day (Sunday) of the given ISO week"""
+    # ISO week: Senin = 1, Minggu = 7
+    # Hitung hari pertama (Senin) dari minggu tersebut
+    first_day = datetime.strptime(f'{year}-W{int(week):02d}-1', "%G-W%V-%u")
+    # Tambahkan 6 hari untuk mendapatkan Minggu (akhir minggu)
+    last_day = first_day + timedelta(days=6)
+    return last_day.strftime("%Y-%m-%d")
+
+def proses_export(year, chat_id, message_id=False, week=None):
+    logger.info(f"proses_export started - year: {year}, chat_id: {chat_id}, week: {week}")
     if message_id:
         bot.edit_message_text(f"Mohon tunggu",chat_id, message_id)
-        
+
     current_date = datetime.now().date()
     iso_year, iso_week, iso_day = current_date.isocalendar()
-    
-    # iso_week = iso_week
-    print(iso_year, iso_week, iso_day)
+
+    # Use provided week or current week
+    if week is not None:
+        iso_week = int(week)
+
+    # Calculate end date for the selected week
+    end_date = get_week_end_date(year, iso_week)
+
+    logger.debug(f"ISO calendar - year: {iso_year}, week: {iso_week}, day: {iso_day}, end_date: {end_date}")
     
     divisi = Get_Data_from_Table('user_divisi')
     for d in divisi:
         if message_id:
             bot.edit_message_text(f"Mohon tunggu Memproses Export Divisi {d[2]}",chat_id, message_id)
-            
+
         employee = GetAllEmployeeForRekap(condition=f'code_dep = "{d[1]}" AND role = "Staff"', year=int(year)-1)
-        print(employee)
+        logger.debug(f"Fetched {len(employee) if employee else 0} employees for division: {d[2]}")
         filename = f'W{iso_week}-{d[2]}.pdf'
         if not len(employee) == 0:
-            process_template_export(employee, year, filename)
+            process_template_export(employee, year, filename, end_date=end_date)
             doc_path = f'{os.getcwd()}/new-bot/ModulPdf/{filename}'
             with open(doc_path, 'rb') as doc:
                 bot.send_document(chat_id, doc)
@@ -183,7 +350,7 @@ def proses_export(year, chat_id, message_id=False):
     employee = GetAllEmployeeForRekap(condition=f'(role = "Spv" OR role = "JuniorSpv" OR role = "SE Advisor")',year=int(year)-1)
     filename = f'W{iso_week}-SUPERVISOR.pdf'
     if not len(employee) == 0:
-        process_template_export(employee, year, filename)
+        process_template_export(employee, year, filename, end_date=end_date)
         doc_path = f'{os.getcwd()}/new-bot/ModulPdf/{filename}'
         with open(doc_path, 'rb') as doc:
             bot.send_document(chat_id, doc)
@@ -195,7 +362,7 @@ def proses_export(year, chat_id, message_id=False):
     employee = GetAllEmployeeForRekap(condition=f'code_dep = "MANAGEMENT"',year=int(year)-1)
     filename = f'W{iso_week}-MANAGEMENT.pdf'
     if not len(employee) == 0:
-        process_template_export(employee, year, filename)
+        process_template_export(employee, year, filename, end_date=end_date)
         doc_path = f'{os.getcwd()}/new-bot/ModulPdf/{filename}'
         with open(doc_path, 'rb') as doc:
             bot.send_document(chat_id, doc)
@@ -206,7 +373,7 @@ def proses_export(year, chat_id, message_id=False):
     employee = GetAllEmployeeForRekap(year=int(year)-1)
     filename = f'W{iso_week}-SeluruhKaryawan.pdf'
     if not len(employee) == 0:
-        process_template_export(employee, year, filename)
+        process_template_export(employee, year, filename, end_date=end_date)
         doc_path = f'{os.getcwd()}/new-bot/ModulPdf/{filename}'
         with open(doc_path, 'rb') as doc:
             bot.send_document(chat_id, doc)
@@ -969,7 +1136,7 @@ def process_input_absen_3(message, data):
     
 def process_input_absen_4(message, data):
     hour, min = string_to_time(message.text)
-    print(hour,min)
+    logger.debug(f"Parsed time from input: hour={hour}, min={min}")
     if hour is not False:
         dat = data.split('.')
         inline_keyboard = InlineKeyboardMarkup(row_width=2)
@@ -977,9 +1144,10 @@ def process_input_absen_4(message, data):
             InlineKeyboardButton('Ya', callback_data=f'inputAbsen2_{data}.{hour}.{min}'),
             InlineKeyboardButton('Tidak', callback_data=f'batal'),
         )
-        print(message.chat.id)
+        logger.debug(f"Sending absen confirmation to chat_id: {message.chat.id}")
         bot.send_message(message.chat.id, f"Apakah Anda yakin ingin menginput absen berikut:\n\nNama : {dat[1]}\nTanggal : {dat[0]}\nPukul : {hour}:{min}", reply_markup=inline_keyboard)
     else:
+        logger.warning(f"Invalid time input from chat_id {message.chat.id}: {message.text}")
         bot.send_message(message.chat.id, f"{min}")
         process_input_absen_3(message, data)
 # ==================================================input_absen end====================================================
@@ -1046,9 +1214,17 @@ def callback_identifier(identifier, data, call):
         delete_callback_markup_keyboard(call,bot)
 
     def export():
-        proses_export(data, call.message.chat.id, call.message.message_id)
+        # Show week selection instead of directly exporting
+        show_week_selection(data, call.message.chat.id, call.message.message_id)
+
+    def exportweek():
+        # Parse year and week from data (format: year.week)
+        newdata = data.split('.')
+        year = newdata[0]
+        week = newdata[1]
+        proses_export(year, call.message.chat.id, call.message.message_id, week=week)
         delete_callback_markup_keyboard(call,bot)
-        
+
     def rekapdivisi():
         proses_rekap_divisi(data, call.message.chat.id, call.message.message_id)
         delete_callback_markup_keyboard(call,bot)
@@ -1204,14 +1380,14 @@ def callback_identifier(identifier, data, call):
         
     def ProsesAbsen2():
         delete_callback_markup_keyboard(call,bot)
-        print(data)
+        logger.info(f"ProsesAbsen2 triggered with data: {data}")
         dat = data.split('.')
         pin = dat[2]
         date = dat[0]
         nama = dat[1]
         hour = dat[3]
         min = dat[4]
-                    
+
         first_name = call.message.chat.first_name
         last_name = call.message.chat.last_name
         username = call.message.chat.username
@@ -1226,18 +1402,21 @@ def callback_identifier(identifier, data, call):
             executor = username
         else:
             executor = str(user_id)
-            
+
+        logger.info(f"Processing absen input - nama: {nama}, date: {date}, time: {hour}:{min}, executor: {executor}")
         result = input_absensi_to_windows(pin,date,hour,min,executor)
         if(result is True):
+            logger.info(f"Absen input successful - nama: {nama}, date: {date}, time: {hour}:{min}")
             global tele_id_admin
             for id in tele_id_admin:
                 bot.send_message(id, text=f"Input Absen Berhasil ✅, dengan detail sebagai berikut:\n\nNama : {nama}\nTanggal Absen : {date}\nJam Absen : {hour}:{min}\nPelaksana : {executor}")
         else:
+            logger.error(f"Absen input failed - nama: {nama}, date: {date}, time: {hour}:{min}")
             bot.send_message(call.message.chat.id, f"Input Gagal hubungi Dev ❌")
             
     def deleteAbsen():
         delete_callback_markup_keyboard(call,bot)
-        print(data)
+        logger.info(f"deleteAbsen triggered with data: {data}")
         dat = data.split('.')
         inline_keyboard = InlineKeyboardMarkup(row_width=2)
         inline_keyboard.add(
@@ -1245,12 +1424,13 @@ def callback_identifier(identifier, data, call):
             InlineKeyboardButton('Tidak', callback_data=f'batal'),
         )
 
+        logger.debug(f"Showing delete confirmation for absen - nama: {dat[1]}, date: {dat[0]}")
         bot.send_message(call.message.chat.id, f"Apakah Anda yakin ingin menghapus absen berikut:\n\nNama : {dat[1]}\nTanggal : {dat[0]}\nPukul : {dat[3]}", reply_markup=inline_keyboard)
-        
-        
+
+
     def deleteAbsen2():
         delete_callback_markup_keyboard(call,bot)
-        print(data)
+        logger.info(f"deleteAbsen2 triggered with data: {data}")
         dat = data.split('.')
         pin = dat[2]
         nama = dat[1]
@@ -1283,6 +1463,7 @@ def callback_identifier(identifier, data, call):
     switch_dict = {
         'rekap': rekap,
         'export': export,
+        'exportweek': exportweek,
         'rekapdivisi': rekapdivisi,
         'batal': batal,
         'editcutibersama': editcutibersama,
@@ -1316,37 +1497,134 @@ def callback_identifier(identifier, data, call):
 # ==================================================scheduled====================================================
 # Function to send a scheduled message
 def send_scheduled_message():
-    for id in tele_id_admin:
-        today_process(id)
-        
+    logger.info(f"[SCHEDULED] send_scheduled_message triggered at {datetime.now()}")
+    logger.info(f"[SCHEDULED] Current system time: {datetime.now().strftime('%A %H:%M:%S')}")
+    try:
+        for id in tele_id_admin:
+            logger.info(f"[SCHEDULED] Sending scheduled message to admin ID: {id}")
+            today_process(id)
+        logger.info("[SCHEDULED] send_scheduled_message completed successfully")
+    except Exception as e:
+        logger.error(f"[SCHEDULED] Error in send_scheduled_message: {str(e)}", exc_info=True)
+
+def cleanup_memory():
+    """Periodic cleanup to prevent memory leaks"""
+    global all_employees, global_get_izin_by_date
+    logger.info("[CLEANUP] Running periodic memory cleanup...")
+
+    # Clear employee cache to force refresh from DB
+    if all_employees:
+        all_employees.clear()
+        logger.info("[CLEANUP] Cleared all_employees cache")
+
+    # Clear old entries from global_get_izin_by_date (older than 24 hours)
+    if global_get_izin_by_date:
+        initial_count = len(global_get_izin_by_date)
+        global_get_izin_by_date.clear()
+        logger.info(f"[CLEANUP] Cleared {initial_count} entries from global_get_izin_by_date")
+
+    logger.info("[CLEANUP] Memory cleanup completed")
+
 def export_scheduled_message():
+    logger.info(f"[SCHEDULED] export_scheduled_message triggered at {datetime.now()}")
     year = datetime.now().year
-    for id in tele_id_admin:
-        proses_export(year, id)
+
+    max_retries = 3
+    retry_delay = 300  # 5 minutes in seconds
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"[SCHEDULED] Export attempt {attempt}/{max_retries}")
+            for id in tele_id_admin:
+                logger.info(f"[SCHEDULED] Exporting year {year} for admin ID: {id}")
+                proses_export(year, id)
+            logger.info("[SCHEDULED] export_scheduled_message completed successfully")
+            return  # Success, exit function
+        except Exception as e:
+            logger.error(f"[SCHEDULED] Export attempt {attempt}/{max_retries} failed: {str(e)}", exc_info=True)
+
+            if attempt < max_retries:
+                logger.info(f"[SCHEDULED] Waiting {retry_delay} seconds before retry...")
+                time.sleep(retry_delay)
+            else:
+                # All retries failed, send notification to admins
+                logger.error("[SCHEDULED] All retry attempts failed. Notifying admins...")
+                error_message = (
+                    "❌ EXPORT WEEKLY REPORT OTOMATIS GAGAL\n"
+                    "Harap lakukan export manual."
+                )
+                for id in tele_id_admin:
+                    try:
+                        bot.send_message(id, error_message)
+                        logger.info(f"[SCHEDULED] Failure notification sent to admin ID: {id}")
+                    except Exception as notify_error:
+                        logger.error(f"[SCHEDULED] Failed to notify admin {id}: {str(notify_error)}")
 
 # Schedule the job to run every day at 10 o'clock
+logger.info("[SCHEDULER] Setting up scheduled jobs...")
+
+# Daily memory cleanup at 3 AM
+schedule.every().day.at("03:00").do(cleanup_memory)
+logger.info("[SCHEDULER] Daily 03:00 memory cleanup job scheduled")
+
 schedule.every().sunday.at("16:00").do(export_scheduled_message)
+logger.info("[SCHEDULER] Sunday 16:00 export job scheduled")
 
 schedule.every().monday.at("10:16").do(send_scheduled_message)
+logger.info("[SCHEDULER] Monday 10:16 scheduled message job scheduled")
 schedule.every().tuesday.at("10:16").do(send_scheduled_message)
+logger.info("[SCHEDULER] Tuesday 10:16 scheduled message job scheduled")
 schedule.every().wednesday.at("10:16").do(send_scheduled_message)
+logger.info("[SCHEDULER] Wednesday 10:16 scheduled message job scheduled")
 schedule.every().thursday.at("10:16").do(send_scheduled_message)
+logger.info("[SCHEDULER] Thursday 10:16 scheduled message job scheduled")
 schedule.every().friday.at("10:16").do(send_scheduled_message)
+logger.info("[SCHEDULER] Friday 10:16 scheduled message job scheduled")
 
 # Function to run the polling loop in a separate thread
-def polling_thread():
+def polling_thread_func():
+    logger.info("[POLLING] Polling thread started")
     while True:
         try:
-            bot.polling(none_stop=True)
+            logger.debug("[POLLING] Starting bot polling...")
+            # Use none_stop=True with timeout to prevent memory buildup
+            bot.polling(none_stop=True, timeout=20, long_polling_timeout=20)
+        except KeyboardInterrupt:
+            logger.info("[POLLING] Polling interrupted by user")
+            break
         except Exception as e:
-            print(f"Error in polling: {e}")
+            # Only log error summary without full traceback for network errors
+            error_msg = str(e)
+            if "MaxRetryError" in error_msg or "ConnectionError" in error_msg:
+                logger.warning(f"[POLLING] Network error (suppressed): {error_msg[:100]}...")
+            else:
+                logger.error(f"[POLLING] Error in polling: {error_msg}", exc_info=True)
+            logger.info("[POLLING] Retrying polling in 5 seconds...")
             time.sleep(5)
 
 # Start the polling thread
-polling_thread = threading.Thread(target=polling_thread)
+logger.info("[STARTUP] Starting polling thread...")
+polling_thread = threading.Thread(target=polling_thread_func, daemon=True)
 polling_thread.start()
+logger.info("[STARTUP] Polling thread started")
 
 # Keep the main thread running for the scheduled tasks
-while True:
-    schedule.run_pending()
-    time.sleep(1)
+logger.info("[STARTUP] Starting scheduler loop...")
+logger.info(f"[STARTUP] Current system timezone: {time.tzname}")
+scheduler_log_counter = 0
+try:
+    while True:
+        try:
+            schedule.run_pending()
+            scheduler_log_counter += 1
+            # Log scheduler status every 3600 seconds (1 hour) to reduce log noise
+            if scheduler_log_counter % 3600 == 0:
+                logger.debug(f"[SCHEDULER] Scheduler running - Current time: {datetime.now().strftime('%A %H:%M:%S')}")
+                scheduler_log_counter = 0  # Reset counter to prevent integer overflow
+            time.sleep(1)
+        except Exception as e:
+            logger.error(f"[SCHEDULER] Error in scheduler loop: {str(e)}", exc_info=True)
+            time.sleep(5)
+except KeyboardInterrupt:
+    logger.info("[SHUTDOWN] Bot stopped by user")
+    logger.info("=" * 50)

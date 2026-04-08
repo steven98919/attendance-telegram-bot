@@ -60,3 +60,6 @@ Thumbs.db
 *.tmp
 temp/
 tmp/
+
+# PDF files
+*.pdf
